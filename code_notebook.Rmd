@@ -1,0 +1,376 @@
+---
+title: "Modleing fish weight with multiple linear regression"
+output: rmarkdown::github_document
+---
+
+```{r echo=FALSE, include = FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE)
+```
+
+# Objective
+This notebook explores using multiple linear regression to model fish weight. 
+
+[Journal of Stats Edu data source](http://jse.amstat.org/datasets/fishcatch.txt).
+
+###### Species Breakdowns
+| Code | Finnish | Swedish | English | Latin
+|:----|:-----|:----|:----|:----|
+|1   |Lahna    |Braxen     |Bream          |Abramis brama|
+|2   |Siika    |Iiden      |Whitefish      |Leusiscus idus|
+|3   |Saerki   |Moerten    |Roach          |Leuciscus rutilus|
+|4   |Parkki   |Bjoerknan  |Silver Bream   |Abramis bjrkna|
+|5   |Norssi   |Norssen    |Smelt          |Osmerus eperlanus|
+|6   |Hauki    |Jaedda     |Pike           |Esox lucius|
+|7   |Ahven    |Abborre    |Perch          |Perca fluviatilis|
+
+###### Additional Variables
+| Data Variable | Description
+|:----|:----|
+|Weight      |Weight of the fish (in grams)|
+|Length1     |Length from the nose to the beginning of the tail (in cm)|
+|Length2     |Length from the nose to the notch of the tail (in cm)|
+|Length3     |Length from the nose to the end of the tail (in cm)|
+|Height      |Maximal height as % of Length3|
+|Width       |Maximal width as % of Length3|
+|Sex         |1 = male 0 = female|
+
+<!-- | Fish Dim |  -->
+<!-- |:------:| -->
+<!-- |    ___/////___                   _| -->
+<!-- |    /           \    ___          || -->
+<!-- |  /\             \_ /  /          H| -->
+<!-- |<   )            __)  \           || -->
+<!-- |  \/_\\_________/   \__\          _| -->
+<!-- | -->
+<!-- ||------- L1 -------|| -->
+<!-- ||------- L2 ----------|| -->
+<!-- ||------- L3 ------------|| -->
+
+# Load data, clean, sanity check
+Warning: running this code chunk installs packages that aren't already installed.
+```{r}
+required_packages <- c('MASS', 'tidyverse', 'GGally', 'faraway', 'corrplot', 
+                       'broom', 'corrr', 'modelr', 'gridExtra',
+                       'caret', 'leaps', 'ggfortify', 'gvlma')
+for(p in required_packages) {
+  if(!require(p,character.only = TRUE)) 
+        install.packages(p, repos = "http://cran.us.r-project.org")
+  library(p,character.only = TRUE)
+}
+pct_formater_1 <- scales::label_percent(accuracy = 1)
+```
+
+```{r}
+url <- "http://jse.amstat.org/datasets/fishcatch.dat.txt"
+df_fish <- read_table(file = url, 
+           col_names = c("Obs", "Species", "Weight", 
+                         "Length1", "Length2", "Length3",
+                         "Height", "Width", "Sex"))
+glimpse(df_fish)
+```
+Check NAs count per variable
+```{r}
+df_fish %>% 
+  map_df(~sum(is.na(.))) %>%
+  gather(key="variable", value="NA_count") %>%
+  filter(NA_count>=1) %>%
+  mutate(percent_total_rows_NA = pct_formater_1(NA_count/nrow(df_fish)))
+```
+
+Drop sex/Obs variable + drop observation with missing weight.  
+Could impute the missing weight variable but since it's the target var deciding to drop
+```{r}
+df_fish_clean <- df_fish %>% 
+  dplyr::select(-Sex, -Obs) %>%
+  filter(!is.na(Weight) & Weight != 0)
+
+### convert Species var to factor Species name
+df_fish_clean <- df_fish_clean %>% 
+ mutate(Species = case_when(
+                     Species == 1 ~ "Bream",
+                     Species == 2 ~ "Whitefish",
+                     Species == 3 ~ "Roach",
+                     Species == 4 ~ "Silver Bream",
+                     Species == 5 ~ "Smelt",
+                     Species == 6 ~ "Pike",
+                     Species == 7 ~ "Perch"),
+        Species = factor(Species, ordered = FALSE)
+)
+```
+
+# Data Exploration
+View summary stats by species
+```{r}
+df_fish_clean %>% split(.$Species) %>% map(summary)
+```
+
+```{r}
+df_fish_clean %>%
+  ### transformation to make the data easier to plot
+  gather(key="metric", value="value", -Species) %>%
+  ggplot(aes(x=value, fill=Species, group=Species)) +
+  geom_histogram(bins = 40) +
+  facet_grid(Species ~ metric, scale="free") +
+  theme(legend.position = "none") +
+  labs(title = "Histograms by species metric")
+```
+
+```{r}
+df_fish_clean %>%
+  ggplot(aes(x=Species, y=Weight, fill=Species, group=Species)) +
+  geom_boxplot() +
+  facet_grid(. ~ Species, scale="free") +
+  labs(title="Boxplots to compare weight by species")
+```
+
+Looks to be a curved relationship between length variables and weight.  
+Could be useful to add polynomial features to fit the curves.
+```{r}
+### check to see if there looks to be linear trend between weight and other variables
+df_fish_clean %>%
+  gather(key="metric", value="value", -Species, -Weight) %>%
+  ggplot(aes(x=value, y=Weight, color=Species)) +
+  geom_smooth(aes(group=1), method="lm", se=F, size=0.5, color="grey40") +
+  geom_point(size=1, alpha=0.5) +
+  facet_wrap(. ~ metric, scale="free") +
+  labs(title="Scatterplot of predictor variable and weight",
+       x="")
+```
+
+Length variables have high correlation.  
+We can use length 1 only: to represent the 3 length variables.  
+Length 1 is the measurement of nose to tip of tail which should represent where the bulk of weight lands.  
+Dropping highly correlated features can help prevent multicollinearity which makes coefficients unreliable.
+```{r}
+predictors_cor <- cor(df_fish_clean %>% dplyr::select(-Species))
+
+### Correlations all Species
+col <- colorRampPalette(c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))
+corrplot(predictors_cor, method="color", col=col(200),  
+         type="upper", order="hclust", 
+         addCoef.col = "black", 
+         tl.col="black", tl.srt=45, #Text label color and rotation
+         diag=FALSE )
+```
+
+
+```{r}
+df_fish_clean %>%
+  group_by(Species) %>%
+  nest() %>%
+  mutate(cor_data = map(data, function(df_fish_clean) correlate(df_fish_clean, diagonal = 1))) %>%
+  select(-data) %>%
+  unnest(cor_data) %>%
+  gather(key="Variable", value="value", -Species, -rowname) %>%
+  ggplot(aes(x=rowname, y=Variable, fill=value)) +
+  geom_tile() +
+  geom_text(aes(label=round(value,2)), angle=90) +
+  facet_grid(. ~ Species) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(title="Metric correlation by Species", x="", y="")
+```
+  
+Check for outlier points by species.  
+Diagnostic plots can be used to determine if these points have leverage on model fit.
+```{r}
+df_fish_clean %>% 
+      ungroup() %>%
+      mutate(row_id = row_number()) %>%
+      group_by(Species) %>%
+      mutate(mod_zscore_by_species = (Weight - median(Weight))/ sd(Weight)) %>%
+      filter(abs(mod_zscore_by_species)>=2) %>%
+      arrange(-abs(mod_zscore_by_species))
+```
+# Modeling
+
+### Multiple linear regression assumptions
+- Linearity
+- Errors are normally distributed (needed to get reliable coefficient estimates + overall test sig)
+- Errors have constant variance (aka homoscedasticity)
+- Errors are indepenent
+- Perfect multicolinearity doesn't exist
+- Independent variables don't correlate with error term
+
+### We'll take the log of the target weight variable
+- Taking the log helps to not over-penalize largest weight observations
+- Taking the log can also help transform a exponential relationships into a linear relationship
+- Can help meet constant variance assumption
+- Callout: taking the log of the target variable is not to make the target more normally distributed. Normality of target variables or predictor variables is not an assumption for linear regression.
+
+### Interpreting model output when only target is log transformed
+- Coefficients give the percent change in response for every one unit increase in x.
+- If needed, use this formula to convert coefficient values: (exp(coefficient_value) - 1)*100 = % change in Y for every one unit increase in x.
+
+### We'll use feature sub selection to find simple model which performs well and has low multicolinearity impact
+
+##### Metrics callouts when using feature sub selection
+- [R^2 / RSS / MSE (RSS/n)] all decrease with more features added.
+
+- Below metrics indirectly estimate test error by adding an adjustment to number of features included in the model.
+    - Adjust R squared: percent of variation explained by the model which penalizes for additional predictors. Will not increase if the added predictors don't help the model performance. R^2a: 1 - ((n-1)/(n-p)) x (1-R^2)
+    - BIC (Bayesian Information Criterion): measure of model quality. Tends to have larger penalty than AIC and tends to recommend smaller model than AIC.
+    - AIC (Akaike Information Criterion): measure of model quality. Smaller the better when comparing models. 
+    - Mallows’s Cp: gets at how much error is left unexplained by the partial model. Smaller CP is better. Consider selecting smallest model where CP <= p or CP near p. P  number of features.
+
+##### Common methods for linear regression predictor subset selection
+- Exhaustive: test all model predictor combinations. 2^p combinations
+- Forward Selection: add one predictor at a time if pvalue below X. Pick lowest pvalue predictor.
+- Backward Selection: build full model. remove one predictor at a time 
+if pvalue above X till stopping criteria is hit.
+- Hybrid Forward and Backward Stepwise Selection: forward selection to determine predictors 
+to add. Looks back as predictors are added to see if predictors should be removed.
+
+
+Given reasonable number of features (2^p) we can use exhaustive selection.  
+Not recommended when number of features is large.
+```{r}
+### Using exhaustive search given reasonable number of feature combinations 2^P
+# methods backward and forward can also be used via the leaps package
+model_exhaustive_select <- regsubsets(log(Weight) ~ Species + poly(Length1, 3) + Width * Height, data=df_fish_clean, 
+                                      nbest=1, nvmax=NULL, method="exhaustive")
+summary_model_exhaustive_select <- summary(model_exhaustive_select)
+```
+
+Not much benefit including more than 5 variables in the model.  
+For the various metrics, we can see top model performance by number of variables included.
+```{r}
+tibble(adjr2=summary_model_exhaustive_select$adjr2,
+       Cp=summary_model_exhaustive_select$cp,
+       BIC=summary_model_exhaustive_select$bic) %>%
+      mutate(num_of_vars = row_number()) %>%
+      gather(key="metric", value="value", -num_of_vars) %>%
+      ggplot(aes(x=num_of_vars, y=value, color=factor(num_of_vars))) +
+      geom_line(aes(group=1), alpha=0.4, color="grey40") +  
+      geom_point() +
+      scale_x_continuous(breaks = 1:20) +
+      facet_wrap(. ~ metric, scales="free") +
+      theme(legend.position = "none")
+```
+
+Visualizing which variables were included for each metric variable count iteration.  
+Metrics are in agreement when model includes intercept and one variable (i.e. use first order length 1 variable).  
+We see some disagreement arise when more variables are added to the model.
+```{r}
+### Function inspiration source: https://gist.github.com/dkahle/7942a7eba8aaa026d0bab6a1e9d88580
+ggregsubsets <- function(x){
+  if(inherits(x, "regsubsets")) x <- summary(x)
+  if(!inherits(x, "summary.regsubsets"))
+    stop("The input to ggregsubsets() should be the result of regsubsets().")
+  df <- bind_cols(
+    as.data.frame(x$which), 
+    as.data.frame(x[c("adjr2","cp","bic")]),
+    data.frame(nvars = 1:nrow(x$which))
+  )
+  names(df)[1] <- "Int"
+  df %>% 
+    mutate(adjr2 = 100*adjr2) %>% 
+    gather(variable, is_in, -adjr2, -cp, -bic, -nvars) %>% 
+    gather(measure, value, -nvars, -variable, -is_in) %>% 
+    ggplot(aes(variable, factor(round(value)))) +
+    geom_tile(aes(fill = is_in), alpha=0.8) +
+    facet_wrap(. ~ measure, scales = "free_y", ncol=5) +
+    scale_fill_manual("", values = c("TRUE" = "black", "FALSE" = "white"), guide = FALSE) +
+    labs(x = "", y = "") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+}
+
+ggregsubsets(model_exhaustive_select)
+```
+
+Let's explore a final model using Species and the poly(Length1, 3) variables.
+```{r}
+# Bream is the baseline Species 
+model <- lm(log(Weight) ~ Species + poly(Length1, 3), data=df_fish_clean)
+```
+
+Checking diagnostic plots to see if model assumptions look to be violated or if model statistics will be skewed.
+```{r}
+autoplot(model, which = 1:4)
+```
+  
+If we want to use model statistics then it's important to confirm linear model assumptions are not violated.  
+Diagnostic plots are used to assess linear model assumptions.
+
+##### Fitted vs residuals
+- Checks
+    - Linearity: does the fit line track closely to the dashed line or is the line curved.
+    - Can spot potential outliers.
+- Observations
+    - Looks like linearity assumption is met and constant variance is met.
+    - Outliers look to exist.
+    
+##### Normal Q-Q
+- Checks
+    - Are residuals normally distributed.
+- Observations 
+    - Points fall close to normal distribution line (outliers look to be present in the tails).
+
+##### Scale location
+- Checks
+    - Errors have constant variance: errors should look random around straight line vs following a curved shape or funnel.
+- Observations  
+    - Homoscedasticity assumption looks to be met.
+
+##### Cook's distance
+- Checks
+    - Cook's distance is used to find influential data points which impact model fit.
+    - Removing or including influential data points alter model fit.
+    - Points that land far away from the norm should be investigated.
+    - Points above 4/(# of observations − # of predictors − 1) are often considered influential.
+- Observations  
+    - Several observations look to have high leverage on the model fit.
+    - High leverage points might have data errors. More investigation would be needed on the data collection process and domain knowledge could be used to better assess if the observations should be included in the model.
+
+### Checking multicolinearity impact
+* Doesn't impact overall model fit.
+* Impacts interpretability of individual coefficients & pvalues.
+* Linear regression model attempts to hold all other predictors constant when deriving coefficients. When variables are correlated the model isn't able to hold the other variable constant due to the correlation.
+* We can use VIF (variance inflation factor) of each variable to determine if the model is impacted by multicolinearity.
+* VIF measures how much the variance of a regression coefficient is inflated due to multicollinearity in the model.
+* If VIF is above 5 (or 10) then there's a multicolinearity issue.
+
+VIF is below 5 for all the variables included in the model. 
+Doesn't look like multicolinearity is a major issue.
+```{r}
+data.frame(vif(model)) 
+```
+
+### Assessing model performance
+Investigate prediction results by species.  
+Plot prediction results by species.
+```{r}
+df_fish_clean %>%
+      mutate(predicted_log_Weight = predict(model),
+             actual_log_Weight = log(Weight)) %>%
+      group_by(Species) %>%
+      mutate(log_rmse = paste0("Log RMSE: ", round(RMSE(predicted_log_Weight, actual_log_Weight),3))) %>%
+      ggplot(aes(x=predicted_log_Weight, y=actual_log_Weight, color=Species)) +
+      geom_abline(intercept=0, slope=1) +
+      geom_point(alpha=0.6) +
+      facet_wrap(. ~ Species + log_rmse, scale="free", nrow=2) + 
+      theme(legend.position = "none") +
+  labs(title="Predict vs Actual Log Weight by Species")
+```
+
+### Use cross validation to assess model performance on unseen data
+```{r}
+train_control <- trainControl(method="cv", number=5)
+model_cv <- train(log(Weight) ~ Species + poly(Length1, 3), 
+                  data=df_fish_clean, 
+                  trControl=train_control, 
+                  method="lm")
+
+summary(model_cv)
+print(model_cv)
+```
+
+# Conclusions
+- The multiple linear regression model looks to do a good job at modeling fish weight.
+    - Large F stat and low pvalue provide evidence that predictor variables in the model are significant.
+    - We see a high adjusted R squared (e.g. variables in the model explain a large portion of the variance in log weight).
+    - We'll hold off on commenting on the predictor variable coefficients as the diagnostic plots indicate potential problems that might skew model parameters.
+    - The Root Mean Square Log Error from cross validation indicates that we could expect the model to be on average off by `r round(exp(model_cv$results$RMSE),2)` times bigger than the actual weight or 1/`r round(exp(model_cv$results$RMSE),2)` smaller than than the actual weight.
+- How this could be applied to the real world? 
+    - Imagine scientists had a computer vision model which detected fish species and length. 
+    - The linear regression model above could be used to predict fish weight without putting the fish on a scale.
